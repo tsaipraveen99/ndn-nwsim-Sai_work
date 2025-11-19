@@ -200,7 +200,7 @@ class RouterRuntime:
             if router is not None:
                 try:
                     # Process message with timeout protection and detailed logging
-                    timeout_seconds = 5.0  # 5 second timeout per message
+                    timeout_seconds = 10.0  # Increased to 10 seconds for complex operations
                     start_time = time.time()
                     
                     # DEBUG: Only log interest/data messages (bloom_filter_update is too verbose)
@@ -210,21 +210,56 @@ class RouterRuntime:
                         print(f"   🔍 Worker {worker_idx}: Processing {message_type} to router {target_router_id} (msg #{messages_processed + 1})", flush=True)
                         last_log_time = time.time()
                     
-                    # Process message directly
-                    if message_type in ['interest', 'data']:
-                        print(f"   🔍 Worker {worker_idx}: About to call dispatch_message({message_type}) to router {target_router_id}", flush=True)
-                    router.dispatch_message(message_type, payload)
-                    if message_type in ['interest', 'data']:
-                        print(f"   ✅ Worker {worker_idx}: Completed dispatch_message({message_type}) to router {target_router_id}", flush=True)
+                    # CRITICAL FIX: Use threading with timeout to prevent workers from hanging indefinitely
+                    # This ensures workers can recover even if dispatch_message blocks
+                    import threading as worker_threading
+                    
+                    result_container = {'success': False, 'exception': None, 'completed': False}
+                    
+                    def process_with_timeout():
+                        try:
+                            if message_type in ['interest', 'data']:
+                                print(f"   🔍 Worker {worker_idx}: About to call dispatch_message({message_type}) to router {target_router_id}", flush=True)
+                            router.dispatch_message(message_type, payload)
+                            if message_type in ['interest', 'data']:
+                                print(f"   ✅ Worker {worker_idx}: Completed dispatch_message({message_type}) to router {target_router_id}", flush=True)
+                            result_container['success'] = True
+                        except Exception as e:
+                            result_container['exception'] = e
+                        finally:
+                            result_container['completed'] = True
+                    
+                    # Run in a separate thread with timeout
+                    process_thread = worker_threading.Thread(target=process_with_timeout, daemon=True)
+                    process_thread.start()
+                    process_thread.join(timeout=timeout_seconds)
+                    
+                    # Check if processing completed
+                    if not result_container['completed']:
+                        logger.error(
+                            f"Worker {worker_idx}: Message processing TIMEOUT after {timeout_seconds}s "
+                            f"for {message_type} to router {target_router_id}. Worker may be stuck."
+                        )
+                        # Mark as processed anyway to prevent queue from blocking
+                        messages_processed += 1
+                        with self.worker_lock:
+                            if worker_idx < len(self.worker_processed_count):
+                                self.worker_processed_count[worker_idx] += 1
+                        # CRITICAL: Still call task_done() even on timeout to prevent queue blocking
+                        self.queue.task_done()
+                        continue  # Skip to next message
+                    
+                    if result_container['exception']:
+                        raise result_container['exception']
                     
                     # Track successful processing
                     elapsed = time.time() - start_time
                     messages_processed += 1
                     
-                    if elapsed > timeout_seconds:
+                    if elapsed > timeout_seconds * 0.8:  # Warn if close to timeout
                         logger.warning(
                             f"Worker {worker_idx}: Message processing took {elapsed:.2f}s "
-                            f"(>{timeout_seconds}s) for {message_type} to router {target_router_id}"
+                            f"(close to {timeout_seconds}s timeout) for {message_type} to router {target_router_id}"
                         )
                     
                     with self.worker_lock:
@@ -235,6 +270,11 @@ class RouterRuntime:
                         f"Worker {worker_idx}: Error dispatching {message_type} to router {target_router_id}: {exc}",
                         exc_info=True,
                     )
+                    # Still mark as processed to prevent queue blocking
+                    messages_processed += 1
+                    with self.worker_lock:
+                        if worker_idx < len(self.worker_processed_count):
+                            self.worker_processed_count[worker_idx] += 1
             else:
                 # Router not found - log for debugging
                 if messages_processed % 1000 == 0:
@@ -359,8 +399,13 @@ class RouterRuntime:
                             
                             if processed_rate > 0:
                                 rate_str += f", processed_rate={processed_rate:.1f} msgs/s"
-                            elif processed_rate == 0 and total_processed > 0:
+                            elif processed_rate == 0 and total_processed > 0 and elapsed > 5.0:
+                                # Only show "STUCK" warning if we've been waiting > 5 seconds with no progress
                                 rate_str += " ⚠️ WORKERS STUCK"
+                                # Log detailed worker status for debugging
+                                if logger is None:
+                                    print(f"   🔴 Worker status: {alive_workers}/{self.max_workers} alive, "
+                                          f"processed={total_processed}, queue≈{current_size}", flush=True)
                         else:
                             rate_str = ""
                     else:
@@ -680,6 +725,10 @@ class Router:
             print(f"      📍 Router {self.router_id}: About to call handle_data() for {data_packet.name}", flush=True)
             self.handle_data(graph, data_packet, prev_node)
             print(f"      ✅ Router {self.router_id}: handle_data() completed for {data_packet.name}", flush=True)
+        elif message_type == 'fib_update':
+            # Handle FIB update propagation (enqueued to avoid blocking workers)
+            content_name, next_hop, G, visited = payload
+            self.add_to_FIB(content_name, next_hop, G, visited)
         elif message_type == 'bloom_filter_update':
             # Handle Bloom filter update from neighbor
             neighbor_id, bloom_filter = payload
@@ -811,12 +860,26 @@ class Router:
                         propagate_targets.append(neighbor_id)
 
             # Propagate outside the lock to avoid deadlocks
+            # CRITICAL FIX: Enqueue FIB propagation instead of direct recursive calls
+            # This prevents worker threads from getting stuck in recursive call chains
             for neighbor_id in propagate_targets:
                 try:
                     neighbor_router = G.nodes[neighbor_id]['router']
-                    logger.debug(f"Router {self.router_id}: Propagating {content_name} to {neighbor_id}")
-                    next_visited = set(visited)
-                    neighbor_router.add_to_FIB(content_name, self.router_id, G, next_visited)
+                    logger.debug(f"Router {self.router_id}: Enqueueing FIB propagation for {content_name} to {neighbor_id}")
+                    # Use runtime to enqueue instead of direct call to avoid blocking worker
+                    if self.runtime is not None:
+                        next_visited = set(visited)
+                        # Enqueue as a low-priority message to avoid blocking interest/data processing
+                        self.runtime.enqueue(
+                            neighbor_id,
+                            priority=5,  # Low priority for FIB updates
+                            message_type='fib_update',
+                            payload=(content_name, self.router_id, G, next_visited)
+                        )
+                    else:
+                        # Fallback to direct call if no runtime (shouldn't happen in normal operation)
+                        next_visited = set(visited)
+                        neighbor_router.add_to_FIB(content_name, self.router_id, G, next_visited)
                 except Exception as e:
                     logger.error(f"Router {self.router_id}: Error propagating to {neighbor_id}: {e}")
         except Exception as e:
