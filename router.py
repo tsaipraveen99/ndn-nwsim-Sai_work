@@ -204,11 +204,13 @@ class RouterRuntime:
                     start_time = time.time()
                     
                     # DEBUG: Only log interest/data messages (bloom_filter_update is too verbose)
-                    if message_type in ['interest', 'data']:
-                        print(f"   🔍 Worker {worker_idx}: Processing {message_type} to router {target_router_id} (msg #{messages_processed + 1})", flush=True)
-                    elif messages_processed % 1000 == 0:
-                        print(f"   🔍 Worker {worker_idx}: Processing {message_type} to router {target_router_id} (msg #{messages_processed + 1})", flush=True)
-                        last_log_time = time.time()
+                    # Respect QUIET_MODE to reduce output
+                    if not QUIET_MODE:
+                        if message_type in ['interest', 'data']:
+                            print(f"   🔍 Worker {worker_idx}: Processing {message_type} to router {target_router_id} (msg #{messages_processed + 1})", flush=True)
+                        elif messages_processed % 1000 == 0:
+                            print(f"   🔍 Worker {worker_idx}: Processing {message_type} to router {target_router_id} (msg #{messages_processed + 1})", flush=True)
+                            last_log_time = time.time()
                     
                     # CRITICAL FIX: Use threading with timeout to prevent workers from hanging indefinitely
                     # This ensures workers can recover even if dispatch_message blocks
@@ -218,10 +220,10 @@ class RouterRuntime:
                     
                     def process_with_timeout():
                         try:
-                            if message_type in ['interest', 'data']:
+                            if not QUIET_MODE and message_type in ['interest', 'data']:
                                 print(f"   🔍 Worker {worker_idx}: About to call dispatch_message({message_type}) to router {target_router_id}", flush=True)
                             router.dispatch_message(message_type, payload)
-                            if message_type in ['interest', 'data']:
+                            if not QUIET_MODE and message_type in ['interest', 'data']:
                                 print(f"   ✅ Worker {worker_idx}: Completed dispatch_message({message_type}) to router {target_router_id}", flush=True)
                             result_container['success'] = True
                         except Exception as e:
@@ -709,22 +711,26 @@ class Router:
         import time
         dispatch_start = time.time()
         
-        # DEBUG: Only log interest/data messages
-        if message_type in ['interest', 'data']:
+        # DEBUG: Only log interest/data messages (respect QUIET_MODE)
+        if not QUIET_MODE and message_type in ['interest', 'data']:
             print(f"      📍 Router {self.router_id}: dispatch_message({message_type}) START", flush=True)
         
         self.router_time = time.time()
         if message_type == 'interest':
             graph, interest_packet, prev_node = payload
-            print(f"      📍 Router {self.router_id}: About to call handle_interest() for {interest_packet.name}", flush=True)
+            if not QUIET_MODE:
+                print(f"      📍 Router {self.router_id}: About to call handle_interest() for {interest_packet.name}", flush=True)
             self.handle_interest(graph, interest_packet, prev_node)
-            print(f"      ✅ Router {self.router_id}: handle_interest() completed for {interest_packet.name}", flush=True)
+            if not QUIET_MODE:
+                print(f"      ✅ Router {self.router_id}: handle_interest() completed for {interest_packet.name}", flush=True)
         elif message_type == 'data':
             self.data_messages_processed += 1
             graph, data_packet, prev_node = payload
-            print(f"      📍 Router {self.router_id}: About to call handle_data() for {data_packet.name}", flush=True)
+            if not QUIET_MODE:
+                print(f"      📍 Router {self.router_id}: About to call handle_data() for {data_packet.name}", flush=True)
             self.handle_data(graph, data_packet, prev_node)
-            print(f"      ✅ Router {self.router_id}: handle_data() completed for {data_packet.name}", flush=True)
+            if not QUIET_MODE:
+                print(f"      ✅ Router {self.router_id}: handle_data() completed for {data_packet.name}", flush=True)
         elif message_type == 'fib_update':
             # Handle FIB update propagation (enqueued to avoid blocking workers)
             content_name, next_hop, G, visited = payload
@@ -887,7 +893,8 @@ class Router:
         
     def handle_interest(self, G, interest: Interest, prev_node: int):
         """Process incoming Interest packets with improved routing"""
-        print(f"         🔵 Router {self.router_id}: handle_interest() START for {interest.name} from {prev_node}", flush=True)
+        if not QUIET_MODE:
+            print(f"         🔵 Router {self.router_id}: handle_interest() START for {interest.name} from {prev_node}", flush=True)
         logger.debug(f"Router {self.router_id}: Received Interest for {interest.name} from {prev_node}")
         interest_name = str(interest.name)
         
@@ -1115,11 +1122,13 @@ class Router:
                     logger.error(f"Router {self.router_id}: Error forwarding Interest to {next_node}: {e}")
         finally:
             self.log_state_snapshot(f"after Interest {interest_name}")
-            print(f"         ✅ Router {self.router_id}: handle_interest() FINALLY completed for {interest_name}", flush=True)
+            if not QUIET_MODE:
+                print(f"         ✅ Router {self.router_id}: handle_interest() FINALLY completed for {interest_name}", flush=True)
                              
     def handle_data(self, G, data: Data, prev_node: int):
         """Process incoming Data packets"""
-        print(f"         🟢 Router {self.router_id}: handle_data() START for {data.name} from {prev_node}", flush=True)
+        if not QUIET_MODE:
+            print(f"         🟢 Router {self.router_id}: handle_data() START for {data.name} from {prev_node}", flush=True)
         data_name = str(data.name)
         try:
             # Check hop limit (RFC 8569 compliance)
@@ -1253,7 +1262,8 @@ class Router:
             logger.error(f"Router {self.router_id}: Error processing Data: {e}", exc_info=True)
         finally:
             self.log_state_snapshot(f"after Data {data_name}")
-            print(f"         ✅ Router {self.router_id}: handle_data() FINALLY completed for {data_name}", flush=True)
+            if not QUIET_MODE:
+                print(f"         ✅ Router {self.router_id}: handle_data() FINALLY completed for {data_name}", flush=True)
                              
     def forward_data(self, G, data: Data, next_node: int):
         """Forward Data packet to the next node"""
