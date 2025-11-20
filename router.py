@@ -182,6 +182,28 @@ class RouterRuntime:
         if self.stop_event.is_set():
             return
         
+        # FIB UPDATE RATE LIMITING: Throttle FIB updates to prevent queue flooding
+        if message_type == 'fib_update':
+            MAX_FIB_UPDATES_PER_SECOND = int(os.environ.get('NDN_SIM_MAX_FIB_RATE', '50'))
+            current_time = time.time()
+            
+            # Count FIB updates in the last second
+            with self.metrics_lock:
+                # Clean old timestamps (older than 1 second)
+                self.metrics.setdefault('fib_update_times', [])
+                self.metrics['fib_update_times'] = [
+                    t for t in self.metrics['fib_update_times'] 
+                    if current_time - t < 1.0
+                ]
+                
+                # If we're exceeding the rate limit, drop this FIB update
+                if len(self.metrics['fib_update_times']) >= MAX_FIB_UPDATES_PER_SECOND:
+                    logger.debug(f"Dropping FIB update due to rate limit ({len(self.metrics['fib_update_times'])}/{MAX_FIB_UPDATES_PER_SECOND} per second)")
+                    return
+                
+                # Record this FIB update
+                self.metrics['fib_update_times'].append(current_time)
+        
         # BACKPRESSURE MECHANISM (low-risk improvement): Prevent queue flooding
         # If queue is too full, wait briefly to let workers catch up
         MAX_QUEUE_SIZE = int(os.environ.get('NDN_SIM_MAX_QUEUE_SIZE', '10000'))
@@ -769,6 +791,11 @@ class Router:
         self.seen_nonces: Dict[str, Set[int]] = defaultdict(set)
         self.nonce_lock = threading.Lock()
         
+        # FIB update deduplication: Track recently processed FIB updates to prevent duplicates
+        self.recent_fib_updates: Set[tuple] = set()  # (content_name, next_hop) tuples
+        self.fib_update_lock = threading.Lock()
+        self.fib_update_times: List[float] = []  # Track FIB update timestamps for rate limiting
+        
         logger.info(f"Router {router_id} initialized with capacity {capacity}")
         
     def add_neighbor(self, neighbor_id: int):
@@ -828,6 +855,21 @@ class Router:
         elif message_type == 'fib_update':
             # Handle FIB update propagation (enqueued to avoid blocking workers)
             content_name, next_hop, G, visited = payload
+            
+            # DEDUPLICATION: Skip if we've recently processed this exact FIB update
+            with self.fib_update_lock:
+                fib_key = (content_name, next_hop)
+                if fib_key in self.recent_fib_updates:
+                    # Skip duplicate FIB update
+                    logger.debug(f"Router {self.router_id}: Skipping duplicate FIB update for {content_name} via {next_hop}")
+                    return
+                # Add to recent set (will be cleaned up periodically)
+                self.recent_fib_updates.add(fib_key)
+                # Keep only last 1000 entries to prevent memory growth
+                if len(self.recent_fib_updates) > 1000:
+                    # Remove oldest 500 entries (simple cleanup)
+                    self.recent_fib_updates = set(list(self.recent_fib_updates)[-500:])
+            
             self.add_to_FIB(content_name, next_hop, G, visited)
         elif message_type == 'bloom_filter_update':
             # Handle Bloom filter update from neighbor
@@ -962,7 +1004,15 @@ class Router:
             # Propagate outside the lock to avoid deadlocks
             # CRITICAL FIX: Enqueue FIB propagation instead of direct recursive calls
             # This prevents worker threads from getting stuck in recursive call chains
-            for neighbor_id in propagate_targets:
+            # RATE LIMITING: Limit propagation to prevent exponential explosion
+            # If MAX_FIB_PROPAGATION is 0 or negative, propagate to all neighbors (no limit)
+            MAX_PROPAGATION_NEIGHBORS = int(os.environ.get('NDN_SIM_MAX_FIB_PROPAGATION', '10'))
+            if MAX_PROPAGATION_NEIGHBORS > 0:
+                # Limit to first N neighbors (rate limiting is the primary protection)
+                propagation_targets = propagate_targets[:MAX_PROPAGATION_NEIGHBORS]
+            # If MAX_PROPAGATION_NEIGHBORS <= 0, propagate to all neighbors (rely on rate limiting only)
+            
+            for neighbor_id in propagation_targets:
                 try:
                     neighbor_router = G.nodes[neighbor_id]['router']
                     logger.debug(f"Router {self.router_id}: Enqueueing FIB propagation for {content_name} to {neighbor_id}")
