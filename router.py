@@ -148,6 +148,14 @@ class RouterRuntime:
         # Track worker activity for diagnostics
         self.worker_processed_count = [0] * self.max_workers
         self.worker_lock = threading.Lock()
+        # Enhanced metrics collection (low-risk improvement)
+        self.metrics = {
+            'message_times': defaultdict(list),  # Track per-message-type processing times
+            'timeout_count': defaultdict(int),  # Track timeout frequency by message type
+            'queue_size_history': [],  # Track queue size over time
+            'total_messages_processed': 0,
+        }
+        self.metrics_lock = threading.Lock()
         for idx in range(self.max_workers):
             worker = threading.Thread(
                 target=self._worker_loop,
@@ -173,6 +181,27 @@ class RouterRuntime:
     ):
         if self.stop_event.is_set():
             return
+        
+        # BACKPRESSURE MECHANISM (low-risk improvement): Prevent queue flooding
+        # If queue is too full, wait briefly to let workers catch up
+        MAX_QUEUE_SIZE = int(os.environ.get('NDN_SIM_MAX_QUEUE_SIZE', '10000'))
+        max_wait_iterations = 100  # Maximum 1 second of backpressure (100 * 0.01s)
+        iterations = 0
+        
+        while iterations < max_wait_iterations:
+            queue_size = self._estimate_queue_size()
+            if queue_size <= MAX_QUEUE_SIZE:
+                break
+            # Small delay to let workers catch up
+            time.sleep(0.01)
+            iterations += 1
+            if self.stop_event.is_set():
+                return
+        
+        # Log backpressure if it occurred
+        if iterations > 0 and not QUIET_MODE:
+            logger.debug(f"Backpressure applied: waited {iterations * 0.01:.2f}s for queue to drain (size was {queue_size})")
+        
         self.queue.put(PrioritizedItem(priority, (target_router_id, message_type, payload)))
 
     def _worker_loop(self, worker_idx: int = 0):
@@ -200,7 +229,8 @@ class RouterRuntime:
             if router is not None:
                 try:
                     # Process message with timeout protection and detailed logging
-                    timeout_seconds = 10.0  # Increased to 10 seconds for complex operations
+                    # Allow configuration via environment variable (useful for Colab/GPU environments)
+                    timeout_seconds = float(os.environ.get('NDN_SIM_WORKER_TIMEOUT', '10.0'))
                     start_time = time.time()
                     
                     # DEBUG: Only log interest/data messages (bloom_filter_update is too verbose)
@@ -242,6 +272,9 @@ class RouterRuntime:
                             f"Worker {worker_idx}: Message processing TIMEOUT after {timeout_seconds}s "
                             f"for {message_type} to router {target_router_id}. Worker may be stuck."
                         )
+                        # Track timeout in metrics (low-risk improvement)
+                        with self.metrics_lock:
+                            self.metrics['timeout_count'][message_type] += 1
                         # Mark as processed anyway to prevent queue from blocking
                         messages_processed += 1
                         with self.worker_lock:
@@ -257,6 +290,16 @@ class RouterRuntime:
                     # Track successful processing
                     elapsed = time.time() - start_time
                     messages_processed += 1
+                    
+                    # Enhanced metrics collection (low-risk improvement)
+                    with self.metrics_lock:
+                        # Track processing time per message type
+                        self.metrics['message_times'][message_type].append(elapsed)
+                        # Keep only recent 1000 samples per message type to prevent memory bloat
+                        if len(self.metrics['message_times'][message_type]) > 1000:
+                            self.metrics['message_times'][message_type] = \
+                                self.metrics['message_times'][message_type][-1000:]
+                        self.metrics['total_messages_processed'] += 1
                     
                     if elapsed > timeout_seconds * 0.8:  # Warn if close to timeout
                         logger.warning(
@@ -377,6 +420,18 @@ class RouterRuntime:
                 current_size = self._estimate_queue_size()
                 alive_workers = sum(1 for w in self.workers if w.is_alive())
                 
+                # Queue size monitoring (low-risk improvement)
+                with self.metrics_lock:
+                    self.metrics['queue_size_history'].append({
+                        'time': time.time(),
+                        'size': current_size,
+                        'elapsed': elapsed
+                    })
+                    # Keep only recent 1000 samples to prevent memory bloat
+                    if len(self.metrics['queue_size_history']) > 1000:
+                        self.metrics['queue_size_history'] = \
+                            self.metrics['queue_size_history'][-1000:]
+                
                 # Get worker activity stats
                 with self.worker_lock:
                     total_processed = sum(self.worker_processed_count)
@@ -483,6 +538,45 @@ class RouterRuntime:
                 return -1
         except:
             return -1
+
+    def get_metrics(self) -> Dict[str, Any]:
+        """
+        Get current metrics for analysis and debugging.
+        Returns a dictionary with:
+        - message_times: Dict of message type -> list of processing times
+        - timeout_count: Dict of message type -> count of timeouts
+        - queue_size_history: List of queue size snapshots
+        - total_messages_processed: Total count of processed messages
+        - average_processing_times: Dict of message type -> average processing time
+        - timeout_rate: Dict of message type -> timeout rate (0.0 to 1.0)
+        """
+        with self.metrics_lock:
+            # Calculate derived metrics
+            avg_times = {}
+            timeout_rates = {}
+            
+            for msg_type in self.metrics['message_times']:
+                times = self.metrics['message_times'][msg_type]
+                if times:
+                    avg_times[msg_type] = sum(times) / len(times)
+                else:
+                    avg_times[msg_type] = 0.0
+                
+                # Calculate timeout rate
+                total_processed = len(times) + self.metrics['timeout_count'][msg_type]
+                if total_processed > 0:
+                    timeout_rates[msg_type] = self.metrics['timeout_count'][msg_type] / total_processed
+                else:
+                    timeout_rates[msg_type] = 0.0
+            
+            return {
+                'message_times': dict(self.metrics['message_times']),  # Convert defaultdict to dict
+                'timeout_count': dict(self.metrics['timeout_count']),  # Convert defaultdict to dict
+                'queue_size_history': self.metrics['queue_size_history'].copy(),
+                'total_messages_processed': self.metrics['total_messages_processed'],
+                'average_processing_times': avg_times,
+                'timeout_rate': timeout_rates,
+            }
 
     def shutdown(self):
         try:
