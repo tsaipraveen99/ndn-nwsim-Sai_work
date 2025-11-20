@@ -398,7 +398,8 @@ class ContentStore:
         
         # DQN training frequency control
         self.dqn_training_step = 0
-        self.dqn_training_frequency = 10  # Train every N steps
+        # Allow training frequency to be configured via environment variable
+        self.dqn_training_frequency = int(os.environ.get('DQN_TRAINING_FREQUENCY', '10'))  # Train every N steps
         
         # Bloom filter propagation control
         self.bloom_propagation_frequency = 10  # Propagate every N cache insertions
@@ -480,11 +481,13 @@ class ContentStore:
             action_dim = 2
             
             # Create the agent with consistent hyperparameters matching DQNAgent defaults
+            # Allow batch size to be configured via environment variable for GPU optimization
+            batch_size = int(os.environ.get('DQN_BATCH_SIZE', '64'))
             self.dqn_agent = DQNAgent(
                 state_dim=state_dim,
                 action_dim=action_dim,
                 memory_size=max(10000, self.total_capacity * 20),  # Increased for better stability
-                batch_size=64,  # Match default
+                batch_size=batch_size,  # Configurable via DQN_BATCH_SIZE env var
                 gamma=0.99,  # Match default - future reward discount factor
                 epsilon_start=1.0,
                 epsilon_end=0.01,  # Match default

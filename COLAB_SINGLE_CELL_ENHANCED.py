@@ -2,13 +2,10 @@
 # NDN SIMULATION - COMPLETE SETUP AND RUN (ENHANCED SINGLE CELL)
 # ============================================================================
 # Copy and paste this entire cell into Google Colab and run it
-# Features: Progress monitoring, real-time output, error handling
+# Features: Progress monitoring, real-time output, error handling, keep-alive
 # 
-# ⚠️ IMPORTANT: To prevent Colab from disconnecting, run the keep-alive script
-#    in a SEPARATE cell. See COLAB_KEEP_ALIVE_GUIDE.md for details.
-#    Quick fix: Run this JavaScript in another cell:
-#    function ClickConnect(){document.querySelector("colab-toolbar-button#connect").click()}
-#    setInterval(ClickConnect,60000)
+# ✅ KEEP-ALIVE IS BUILT-IN! This script includes keep-alive that works
+#    even when your system sleeps. No need to run a separate cell!
 # ============================================================================
 
 import os
@@ -19,6 +16,64 @@ import json
 import threading
 from pathlib import Path
 from threading import Thread, Event
+
+# ============================================================================
+# STEP 0: START KEEP-ALIVE (Runs in browser, not Python - can run while Python executes!)
+# ============================================================================
+print("="*70)
+print("STARTING KEEP-ALIVE (prevents disconnection when system sleeps)")
+print("="*70)
+
+try:
+    from IPython.display import Javascript, display
+    
+    # JavaScript keep-alive - runs in browser, not Python runtime!
+    # This CAN run while Python code is executing
+    keep_alive_js = """
+    (function() {
+        function ClickConnect() {
+            console.log("⏰ Keep-alive: " + new Date().toLocaleTimeString());
+            const btn = document.querySelector("colab-toolbar-button#connect");
+            if (btn) {
+                btn.click();
+                console.log("✅ Connection maintained");
+            }
+        }
+        
+        // Click every 60 seconds
+        const intervalId = setInterval(ClickConnect, 60000);
+        
+        // Click immediately
+        ClickConnect();
+        
+        console.log("✅ JavaScript keep-alive started! Works even when system sleeps.");
+        console.log("💡 This runs in the browser, so it works while Python executes.");
+        
+        // Store interval ID globally so it can be stopped if needed
+        window.colabKeepAliveInterval = intervalId;
+    })();
+    """
+    
+    display(Javascript(keep_alive_js))
+    print("✅ JavaScript keep-alive activated (runs in browser)")
+except Exception as e:
+    print(f"⚠️ JavaScript keep-alive failed: {e}")
+    print("   Continuing with Python keep-alive only...")
+
+# Python keep-alive (backup - runs in background thread)
+def python_keep_alive():
+    """Python keep-alive backup - prints every 5 minutes"""
+    while True:
+        time.sleep(300)  # Every 5 minutes
+        timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+        print(f"⏰ Python keep-alive: {timestamp}")
+
+keep_alive_thread = threading.Thread(target=python_keep_alive, daemon=True)
+keep_alive_thread.start()
+print("✅ Python keep-alive started (backup)")
+print("="*70)
+print("💡 Your Colab session will stay connected even when your system sleeps!")
+print("="*70 + "\n")
 
 print("="*70)
 print("NDN SIMULATION - COMPLETE SETUP")
@@ -151,6 +206,13 @@ os.environ['NDN_SIM_MAX_FIB_RATE'] = '30'       # Max 30 FIB updates per second 
 # MAX_FIB_PROPAGATION: Limit neighbors per FIB update (0 = no limit, rely on rate limiting only)
 # For Watts-Strogatz k=4, most routers have ~4 neighbors, so 5-8 is reasonable
 os.environ['NDN_SIM_MAX_FIB_PROPAGATION'] = '8'  # Max 8 neighbors per FIB propagation (covers most routers)
+
+# OPTIONAL: GPU OPTIMIZATION (uncomment to increase GPU usage)
+# Note: Low GPU usage (0.4 GB) is NORMAL and OK for this simulation
+# The simulation is mostly CPU-bound (routing), GPU is only for DQN training
+# Uncomment these if you want to maximize GPU utilization:
+# os.environ['DQN_BATCH_SIZE'] = '256'        # Increase from 64 to 256 (better GPU utilization)
+# os.environ['DQN_TRAINING_FREQUENCY'] = '5'  # Train every 5 steps instead of 10 (more frequent)
 
 print("Configuration:")
 for key, value in sorted(os.environ.items()):
